@@ -117,12 +117,14 @@ async fn dynamic_preload_link_fires_load_and_error() {
         &mut ctx,
         3,
         "Runtime.evaluate",
-        json!({"expression": "document.styleSheets.length", "returnByValue": true}),
+        json!({"expression": "String(document.styleSheets.length)", "returnByValue": true}),
         session_id,
     )
     .await;
+    let count = sheets["result"]["value"].as_str().unwrap_or("");
     assert_eq!(
-        sheets["result"]["value"], 0,
-        "a preload link must not add a stylesheet to the document"
+        count, "0",
+        "a preload link must not add a stylesheet to the document (got {:?})",
+        count
     );
 }
