@@ -1058,7 +1058,9 @@ pub fn emit_navigation_events(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
-    let mut phase3 = vec![
+    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
+        Vec::new()
+    } else { vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),
             params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
@@ -1079,8 +1081,8 @@ pub fn emit_navigation_events(
             params: json!({"timestamp": ts}),
             session_id: es.clone(),
         },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+    ] };
+    if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
@@ -1269,6 +1271,30 @@ fn network_loading_failed(
             "canceled": error_text == "net::ERR_ABORTED"}),
         session_id,
     }
+}
+
+pub(crate) fn emit_aborted_navigation(
+    ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
+    loader_id: &str, url: &str, method: &str, page_id: &str,
+) {
+    let start = ctx.pending_events.len();
+    let ts = timestamp();
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
+            "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
+            "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFailed".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
+            "errorText": "net::ERR_ABORTED", "canceled": true}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(), session_id: session_id.clone(),
+        params: json!({"frameId": frame_id}),
+    });
+    fan_out_network_events(ctx, page_id, session_id, start);
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1460,6 +1486,43 @@ pub async fn handle(
             });
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
+        "close" => {
+            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let target_id = page.id.clone();
+            if ctx.pending_beforeunload_close.contains_key(&target_id) { return Ok(json!({})); }
+            let confirmation = if page.has_js() {
+                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                    .evaluate("globalThis.__obscura_fireBeforeUnload()")
+                    .as_bool().ok_or("Could not run beforeunload handlers")?
+            } else { false };
+            if confirmation {
+                let url = ctx.get_page(&target_id).ok_or("No page")?.url_string();
+                ctx.pending_beforeunload_close.insert(target_id, session_id.clone());
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.javascriptDialogOpening".into(), session_id: session_id.clone(),
+                    params: json!({"url": url, "type": "beforeunload", "message": "",
+                        "hasBrowserHandler": true, "defaultPrompt": ""}),
+                });
+                return Ok(json!({}));
+            }
+            crate::domains::target::close_target(ctx, &target_id);
+            Ok(json!({}))
+        }
+        "handleJavaScriptDialog" => {
+            let target_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            let accept = params.get("accept").and_then(|value| value.as_bool()).ok_or("accept required")?;
+            let owner = ctx.pending_beforeunload_close.remove(&target_id).ok_or("No dialog is showing")?;
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.javascriptDialogClosed".into(), session_id: owner,
+                params: json!({"result": accept, "userInput": ""}),
+            });
+            if accept { crate::domains::target::close_target(ctx, &target_id); }
+            Ok(json!({}))
+        }
+        "stopLoading" => {
+            ctx.get_session_page_mut(session_id).ok_or("No page for session")?.stop_loading();
+            Ok(json!({}))
+        }
         "getFrameTree" => {
             let page = ctx
                 .get_session_page(session_id)
@@ -1582,13 +1645,20 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
-        // Obscura does not enforce Content-Security-Policy, so there is
-        // nothing to bypass; acknowledge it like Chrome does. Playwright sends
-        // this for every new page of a context created with bypassCSP: true.
-        "setBypassCSP" => Ok(json!({})),
         // Obscura does not download files to disk, so there is no behavior to
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
+        // Obscura never enforces Content-Security-Policy: it reports no
+        // securitypolicyviolation and blocks no resource, so a document's CSP
+        // already has no effect on fetches or script execution. There is
+        // nothing to bypass, so both values ack. Validate the parameter
+        // anyway, so a client sending the wrong type fails on the wire the way
+        // Chrome fails instead of silently ignoring it (issue #1224).
+        "setBypassCSP" => {
+            params.get("enabled").and_then(Value::as_bool)
+                .ok_or("enabled must be a boolean")?;
+            Ok(json!({}))
+        }
         "getLayoutMetrics" => {
             // Playwright calls this before every page.screenshot(). Report the
             // same live CSS viewport that responsive page code and paint use.
@@ -3876,6 +3946,37 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    /// Regression for #1224: a Playwright context created with
+    /// bypass_csp=True sends Page.setBypassCSP, and the catch-all rejected it
+    /// with "Unknown Page method: setBypassCSP", so new_page() failed before
+    /// it could navigate. Obscura enforces no CSP, so both values ack.
+    #[tokio::test]
+    async fn set_bypass_csp_acks_both_values() {
+        for enabled in [true, false] {
+            let mut ctx = CdpContext::new();
+            let result = handle("setBypassCSP", &json!({ "enabled": enabled }), &mut ctx, &None)
+                .await
+                .unwrap_or_else(|err| panic!("setBypassCSP({enabled}) must ack: {err}"));
+            assert_eq!(result, json!({}));
+        }
+    }
+
+    /// The catch-all is fixed for setBypassCSP only; other unknown methods keep
+    /// erroring, and a malformed parameter still fails on the wire.
+    #[tokio::test]
+    async fn set_bypass_csp_rejects_a_missing_or_non_boolean_enabled() {
+        for params in [json!({}), json!({ "enabled": "yes" })] {
+            let mut ctx = CdpContext::new();
+            let err = handle("setBypassCSP", &params, &mut ctx, &None)
+                .await
+                .expect_err("a non-boolean enabled must error");
+            assert!(
+                err.contains("enabled must be a boolean"),
+                "unexpected error for {params}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
